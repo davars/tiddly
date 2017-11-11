@@ -2,84 +2,89 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package tiddly
+package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 
-	"google.golang.org/appengine"
-	"google.golang.org/appengine/datastore"
-	"google.golang.org/appengine/user"
+	"cloud.google.com/go/datastore"
+	"google.golang.org/api/iterator"
 )
 
 // Re Authentication
 //
-// There are currently three redundant layers of authentication checks here.
+// With the apparent impending demise of the App Engine Users API, I've converted this version to sit behind an
+// authenticating proxy like https://github.com/davars/sohop or https://github.com/pusher/oauth2_proxy.  Set the
+// X-Webauth-User header to the authorized user's ID.  In sohop you can add a Headers clause like:
+//     "tiddly": {
+//      "URL": "http://127.0.0.1:8080",
+//      "HealthCheck": "http://127.0.0.1:8080/health",
+//      "Auth": true,
+//      "Headers": { "X-WEBAUTH-USER":["{{.Session.Values.user}}"] }
+//    },
 //
-// 1. app.yaml says 'login: admin'.
-// 2. The installed handlers are wrapped in authCheck during registration in func init.
-// 3. The write operations contain an extra mustBeAdmin check.
-//
-// The redundancy is mainly cautionary, to contain accidents.
-//
-// It should be possible to make a world-readable, admin-writable TiddlyWiki
-// by removing 1 and 2 and double-checking 3.
-//
-// If you remove 'login: admin' from app.yaml you can replace it with 'login: required',
-// requiring a login from any viewer, or you can delete the line entirely,
-// making it possible to fetch pages with no authentication.
-// In that case, users who do have write access (admins) will need to take the extra
-// step of logging in. One way to do this is to make the /auth URL require login
-// and have them start there when visiting, by listing that separately in app.yaml
-// before the default handler:
-//
-//	handlers:
-//	- url: /auth
-//	  login: admin
-//	  secure: always
-//	  script: _go_app
-//
-//	- url: /.*
-//	  secure: always
-//	  script: _go_app
-//
-// If you do this, then unauthenticated users will be able to read content,
-// and TiddlyWiki will let them edit content in their browser, but writes back
-// to the server will fail, producing yellow pop-up error messages in the
-// browser window. In general these are probably good, but this includes
-// attempts to update $:/StoryList, which happens as viewers click around
-// in the wiki. It seems like the TiddlyWeb plugin or the core syncer module
-// would need changes to understand a new "read-only" mode.
 
-func init() {
-	http.HandleFunc("/", authCheck(main))
-	http.HandleFunc("/auth", authCheck(auth))
-	http.HandleFunc("/status", authCheck(status))
-	http.HandleFunc("/recipes/all/tiddlers/", authCheck(tiddler))
-	http.HandleFunc("/recipes/all/tiddlers.json", authCheck(tiddlerList))
-	http.HandleFunc("/bags/bag/tiddlers/", authCheck(deleteTiddler))
-}
+var dsClient = func() *datastore.Client {
+	project := os.Getenv("GCP_PROJECT")
+	if project == "" {
+		log.Fatal("must set GCP_PROJECT env var")
+	}
+	cli, err := datastore.NewClient(context.Background(), project)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return cli
+}()
 
-func authCheck(f http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !mustBeAdmin(w, r) {
-			return
-		}
-		f(w, r)
+func main() {
+	r := http.NewServeMux()
+	r.HandleFunc("/", root)
+	r.HandleFunc("/auth", auth)
+	r.HandleFunc("/status", status)
+	r.HandleFunc("/recipes/all/tiddlers/", tiddler)
+	r.HandleFunc("/recipes/all/tiddlers.json", tiddlerList)
+	r.HandleFunc("/bags/bag/tiddlers/", deleteTiddler)
+
+	http.HandleFunc("/health", health)
+	http.Handle("/", authCheck(r))
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+		log.Printf("Defaulting to port %s", port)
+	}
+
+	log.Printf("Listening on port %s", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatal(err)
 	}
 }
 
+func currentUser(r *http.Request) string {
+	return r.Header.Get("X-Webauth-User")
+}
+
+func authCheck(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !mustBeAdmin(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func mustBeAdmin(w http.ResponseWriter, r *http.Request) bool {
-	ctx := appengine.NewContext(r)
-	u := user.Current(ctx)
-	if u == nil || !user.IsAdmin(ctx) {
+	if currentUser(r) == "" {
 		http.Error(w, "permission denied", 403)
 		return false
 	}
@@ -92,7 +97,7 @@ type Tiddler struct {
 	Text string `datastore:"Text,noindex"`
 }
 
-func main(w http.ResponseWriter, r *http.Request) {
+func root(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "bad method", 405)
 		return
@@ -105,12 +110,14 @@ func main(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "index.html")
 }
 
+func health(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+
 func auth(w http.ResponseWriter, r *http.Request) {
-	ctx := appengine.NewContext(r)
-	u := user.Current(ctx)
-	name := "GUEST"
-	if u != nil {
-		name = u.String()
+	name := currentUser(r)
+	if name == "" {
+		name = "GUEST"
 	}
 	fmt.Fprintf(w, "<html>\nYou are logged in as %s.\n\n<a href=\"/\">Main page</a>.\n", name)
 }
@@ -120,24 +127,23 @@ func status(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad method", 405)
 		return
 	}
-	ctx := appengine.NewContext(r)
 	w.Header().Set("Content-Type", "application/json")
-	u := user.Current(ctx)
-	name := "GUEST"
-	if u != nil {
-		name = u.String()
+	name := currentUser(r)
+	if name == "" {
+		name = "GUEST"
 	}
 	w.Write([]byte(`{"username": "` + name + `", "space": {"recipe": "all"}}`))
 }
 
 func tiddlerList(w http.ResponseWriter, r *http.Request) {
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 	q := datastore.NewQuery("Tiddler")
 	// Only need Meta, but get no results if we do this.
 	if false {
 		q = q.Project("Meta")
 	}
-	it := q.Run(ctx)
+
+	it := dsClient.Run(ctx, q)
 	var buf bytes.Buffer
 	sep := ""
 	buf.WriteString("[")
@@ -145,7 +151,7 @@ func tiddlerList(w http.ResponseWriter, r *http.Request) {
 		var t Tiddler
 		_, err := it.Next(&t)
 		if err != nil {
-			if err == datastore.Done {
+			if err == iterator.Done {
 				break
 			}
 			println("ERR", err.Error())
@@ -197,11 +203,11 @@ func tiddler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getTiddler(w http.ResponseWriter, r *http.Request) {
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 	title := strings.TrimPrefix(r.URL.Path, "/recipes/all/tiddlers/")
-	key := datastore.NewKey(ctx, "Tiddler", title, 0, nil)
+	key := datastore.NameKey("Tiddler", title, nil)
 	var t Tiddler
-	if err := datastore.Get(ctx, key, &t); err != nil {
+	if err := dsClient.Get(ctx, key, &t); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -225,9 +231,9 @@ func putTiddler(w http.ResponseWriter, r *http.Request) {
 	if !mustBeAdmin(w, r) {
 		return
 	}
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 	title := strings.TrimPrefix(r.URL.Path, "/recipes/all/tiddlers/")
-	key := datastore.NewKey(ctx, "Tiddler", title, 0, nil)
+	key := datastore.NameKey("Tiddler", title, nil)
 	data, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "cannot read data", 400)
@@ -244,7 +250,7 @@ func putTiddler(w http.ResponseWriter, r *http.Request) {
 
 	rev := 1
 	var old Tiddler
-	if err := datastore.Get(ctx, key, &old); err == nil {
+	if err := dsClient.Get(ctx, key, &old); err == nil {
 		rev = old.Rev + 1
 	}
 	js["revision"] = rev
@@ -262,14 +268,14 @@ func putTiddler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t.Meta = string(meta)
-	_, err = datastore.Put(ctx, key, &t)
+	_, err = dsClient.Put(ctx, key, &t)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 
-	key2 := datastore.NewKey(ctx, "TiddlerHistory", title+"#"+fmt.Sprint(t.Rev), 0, nil)
-	if _, err := datastore.Put(ctx, key2, &t); err != nil {
+	key2 := datastore.NameKey("TiddlerHistory", title+"#"+fmt.Sprint(t.Rev), nil)
+	if _, err := dsClient.Put(ctx, key2, &t); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -282,27 +288,27 @@ func deleteTiddler(w http.ResponseWriter, r *http.Request) {
 	if !mustBeAdmin(w, r) {
 		return
 	}
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 	if r.Method != "DELETE" {
 		http.Error(w, "bad method", 405)
 		return
 	}
 	title := strings.TrimPrefix(r.URL.Path, "/bags/bag/tiddlers/")
-	key := datastore.NewKey(ctx, "Tiddler", title, 0, nil)
+	key := datastore.NameKey("Tiddler", title, nil)
 	var t Tiddler
-	if err := datastore.Get(ctx, key, &t); err != nil {
+	if err := dsClient.Get(ctx, key, &t); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	t.Rev++
 	t.Meta = ""
 	t.Text = ""
-	if _, err := datastore.Put(ctx, key, &t); err != nil {
+	if _, err := dsClient.Put(ctx, key, &t); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	key2 := datastore.NewKey(ctx, "TiddlerHistory", title+"#"+fmt.Sprint(t.Rev), 0, nil)
-	if _, err := datastore.Put(ctx, key2, &t); err != nil {
+	key2 := datastore.NameKey("TiddlerHistory", title+"#"+fmt.Sprint(t.Rev), nil)
+	if _, err := dsClient.Put(ctx, key2, &t); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
