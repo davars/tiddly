@@ -1,20 +1,21 @@
-FROM golang:latest AS build-env
-ENV GO111MODULE=on
-WORKDIR /app
-COPY go.mod /app
-COPY go.sum /app
-RUN go mod download
-COPY . /app
-RUN go build -v
-RUN ls
+FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS build
+ARG TARGETOS
+ARG TARGETARCH
+ARG BINNAME
 
-FROM debian:latest
+WORKDIR /src/
+
+COPY go.* /src/
+RUN go mod download
+
+COPY . .
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/tiddly .
+
+FROM debian:bookworm-slim
+
 ADD https://raw.githubusercontent.com/cloudflare/cfssl_trust/master/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt
 RUN chmod a+r /etc/ssl/certs/ca-certificates.crt
-RUN mkdir /app
-WORKDIR /app
-# Volume: /path/to/service-account-key.json:/credentials.json
-ENV GOOGLE_APPLICATION_CREDENTIALS=/credentials.json
-COPY --from=build-env /app/tiddly /app/tiddly
-COPY --from=build-env /app/index.html /app/index.html
-ENTRYPOINT [ "/usr/sbin/chroot", "--skip-chdir", "--userspec=nobody", "/", "/app/tiddly" ]
+
+COPY --from=build /out/tiddly /usr/local/bin/tiddly
+EXPOSE 8080
+ENTRYPOINT [ "/usr/sbin/chroot", "--skip-chdir", "--userspec=nobody", "/", "/usr/local/bin/tiddly" ]

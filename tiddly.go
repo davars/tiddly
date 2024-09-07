@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -97,6 +98,10 @@ type Tiddler struct {
 	Text string `datastore:"Text,noindex"`
 }
 
+//go:embed index.html
+var content embed.FS
+var contentFS = http.FileServer(http.FS(content))
+
 func root(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "bad method", 405)
@@ -106,8 +111,7 @@ func root(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", 404)
 		return
 	}
-
-	http.ServeFile(w, r, "index.html")
+	contentFS.ServeHTTP(w, r)
 }
 
 func health(w http.ResponseWriter, r *http.Request) {
